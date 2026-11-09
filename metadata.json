@@ -1,0 +1,6 @@
+{
+  "name": "Six Eyes - Autonomous eBPF TCP Desync Daemon",
+  "description": "Production-grade kernel-level TCP sequence desynchronization & DPI evasion framework (v10).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  six-eyes-daemon:
+    build: .
+    container_name: six_eyes_daemon
+    cap_add:
+      - NET_ADMIN
+      - BPF
+    network_mode: "host"
+    ports:
+      - "1080:1080"
+      - "9090:9090"
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+    restart: unless-stopped
+
+  cartographer:
+    build: .
+    container_name: six_eyes_cartographer
+    command: ["python3", "scanner/cartographer.py", "--target", "cloudflare.com"]
+    depends_on:
+      - six-eyes-daemon
+    network_mode: "host"

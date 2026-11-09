@@ -1,0 +1,6 @@
+name: "six-eyes-stealth"
+strategy: "FAKE_RST"
+split_offset: 2
+fake_rst_ttl: 3
+enable_bad_checksum: true
+target_port: 443
