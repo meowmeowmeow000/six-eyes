@@ -38,6 +38,21 @@ type WarmPool struct {
 }
 
 func NewWarmPool(ctx context.Context, fac factory.StealthFactory, profile *config.CombatProfile, observer FailureObserver) *WarmPool {
+	if profile == nil {
+		return &WarmPool{
+			fac:            fac,
+			sessions:       make([]*smux.Session, 0, 1),
+			routes:         nil,
+			hostHeader:     "",
+			targetCap:      1,
+			keepAliveSec:   10,
+			failThreshold:  3,
+			onFailureEvent: observer,
+			dialSem:        make(chan struct{}, 1),
+			ctx:            ctx,
+		}
+	}
+
 	routes := []config.RouteCandidate{profile.Primary}
 	routes = append(routes, profile.Failovers...)
 
@@ -70,25 +85,44 @@ func NewWarmPool(ctx context.Context, fac factory.StealthFactory, profile *confi
 	return p
 }
 
+func (p *WarmPool) activeRouteLocked() (config.RouteCandidate, bool) {
+	if len(p.routes) == 0 {
+		return config.RouteCandidate{}, false
+	}
+	idx := p.routeIdx % len(p.routes)
+	return p.routes[idx], true
+}
+
 func (p *WarmPool) ActiveRoute() config.RouteCandidate {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.routes[p.routeIdx%len(p.routes)]
+	route, ok := p.activeRouteLocked()
+	if !ok {
+		return config.RouteCandidate{}
+	}
+	return route
 }
 
 func (p *WarmPool) currentRouteAndEpoch() (config.RouteCandidate, uint64) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.routes[p.routeIdx%len(p.routes)], p.routeEpoch
+	route, ok := p.activeRouteLocked()
+	if !ok {
+		return config.RouteCandidate{}, p.routeEpoch
+	}
+	return route, p.routeEpoch
 }
 
 func (p *WarmPool) EscalateStealthMode(newMode string, delayMs, jitterMs int) {
 	p.fac.SetPacing(delayMs, jitterMs)
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.routes) == 0 {
+		return
+	}
 	idx := p.routeIdx % len(p.routes)
 	oldMode := p.routes[idx].StealthMode
 	if oldMode == newMode {
-		p.mu.Unlock()
 		return
 	}
 	p.routes[idx].StealthMode = newMode
@@ -101,7 +135,6 @@ func (p *WarmPool) EscalateStealthMode(newMode string, delayMs, jitterMs int) {
 	p.sessions = make([]*smux.Session, 0, p.targetCap)
 	telemetry.PoolHealthyPipes.Store(0)
 	ip := p.routes[idx].TargetIP
-	p.mu.Unlock()
 
 	for _, s := range oldSessions {
 		_ = s.Close()
@@ -129,6 +162,9 @@ func (p *WarmPool) InjectEmergencyRoute(cand config.RouteCandidate) {
 		}
 	}
 	p.routes = filtered
+	if len(p.routes) == 0 {
+		p.routes = []config.RouteCandidate{cand}
+	}
 	p.routeIdx = 0
 	p.routeEpoch++
 	p.failStreak = 0
@@ -209,6 +245,10 @@ func (p *WarmPool) GetStream(ctx context.Context) (net.Conn, error) {
 }
 
 func (p *WarmPool) dialSession(ctx context.Context) (*smux.Session, error) {
+	if p == nil {
+		return nil, errors.New("warm pool is nil")
+	}
+
 	select {
 	case p.dialSem <- struct{}{}:
 		defer func() { <-p.dialSem }()
@@ -217,6 +257,9 @@ func (p *WarmPool) dialSession(ctx context.Context) (*smux.Session, error) {
 	}
 
 	route, epochAtStart := p.currentRouteAndEpoch()
+	if route.TargetIP == "" {
+		return nil, errors.New("warm pool has no configured routes")
+	}
 	mode := route.StealthMode
 	if mode == "" {
 		mode = factory.ModeTLSFrag
@@ -278,6 +321,11 @@ func (p *WarmPool) dialSession(ctx context.Context) (*smux.Session, error) {
 	}
 
 	if len(p.sessions) >= p.targetCap {
+		if len(p.sessions) == 0 {
+			p.mu.Unlock()
+			_ = session.Close()
+			return nil, errors.New("warm pool session list is empty while capacity reached")
+		}
 		existing := p.sessions[int(p.rrIndex.Add(1))%len(p.sessions)]
 		p.mu.Unlock()
 		_ = session.Close()
@@ -316,7 +364,7 @@ func (p *WarmPool) replenish() {
 	p.mu.Lock()
 	active := make([]*smux.Session, 0, p.targetCap)
 	for _, s := range p.sessions {
-		if !s.IsClosed() {
+		if s != nil && !s.IsClosed() {
 			active = append(active, s)
 		}
 	}
@@ -324,6 +372,10 @@ func (p *WarmPool) replenish() {
 	telemetry.PoolHealthyPipes.Store(int64(len(p.sessions)))
 	deficit := p.targetCap - len(p.sessions)
 	p.mu.Unlock()
+
+	if deficit <= 0 {
+		return
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < deficit; i++ {
@@ -340,10 +392,13 @@ func (p *WarmPool) replenish() {
 }
 
 func (p *WarmPool) removeSession(target *smux.Session) {
+	if target == nil {
+		return
+	}
 	p.mu.Lock()
 	active := make([]*smux.Session, 0, len(p.sessions))
 	for _, s := range p.sessions {
-		if s != target && !s.IsClosed() {
+		if s != nil && s != target && !s.IsClosed() {
 			active = append(active, s)
 		}
 	}
