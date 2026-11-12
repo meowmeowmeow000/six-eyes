@@ -1,73 +1,143 @@
-# SIX EYES (六眼) - Autonomous DPI Evasion Daemon
+# Six Eyes
 
-[![CI Pipeline](https://github.com/six-eyes/six-eyes/actions/workflows/ci.yml/badge.svg)](https://github.com/six-eyes/six-eyes/actions)
-[![License](https://img.shields.io/badge/License-Dual%20GPL%2FBSD-blue.svg)](LICENSE)
-[![Kernel](https://img.shields.io/badge/eBPF-TC%20%2F%20XDP-orange.svg)](https://ebpf.io)
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
+Six Eyes is a Linux-focused research framework for studying TCP desynchronization, active middlebox behavior, and DPI evasion patterns in controlled environments. It combines a Go daemon, eBPF-based packet manipulation, and a small scanner utility to model how network inspection systems react to malformed or strategically desynchronized TCP flows.
 
-**SIX EYES** is an autonomous, kernel-space TCP sequence desynchronization and middlebox counter-surveillance daemon built on Linux **eBPF (Traffic Control)** and **Go**.
+The project is designed for experimentation, architecture exploration, and defensive research rather than for indiscriminate network use. It is intended to be run only in authorized test environments where you have explicit permission to evaluate network behavior.
 
----
+## What this project does
 
-## ⚡ The TCP Sequence State Machine
+At a high level, Six Eyes focuses on:
 
-Stateful Deep Packet Inspection (DPI) middleboxes inspect the plaintext SNI of TLS ClientHello and HTTP Host headers by maintaining an in-memory reassembly queue.
+- Observing how middleboxes inspect and reassemble TCP streams
+- Mutating packet timing, sequence patterns, and payload boundaries
+- Testing DPI evasion strategies in a controlled lab setup
+- Emitting telemetry and structured results for analysis
 
+The system is organized around a small set of core components:
+
+- `cmd/daemon`: service entrypoint and runtime control
+- `pkg/bpf`: eBPF C code and loader integration
+- `pkg/desync`: TCP desynchronization state machine logic
+- `pkg/proxy`: transparent proxy / relay behavior
+- `pkg/config`: strategy and profile configuration
+- `pkg/scanner`: scan utilities for target and path discovery
+- `scanner/`: Python-based middlebox/cartographer helpers
+
+## Architecture overview
+
+The daemon is built around a Go control plane with an eBPF datapath. The idea is to let the kernel observe and manipulate packet flows while the Go service orchestrates policy, telemetry, and runtime configuration.
+
+A typical execution flow looks like this:
+
+1. The daemon boots and loads configuration profiles.
+2. The eBPF program attaches to the relevant traffic path and monitors packet flows.
+3. The desync logic computes sequence-handling strategies based on the configured profile.
+4. Packet mutations are applied to influence how inspection systems reconstruct and classify traffic.
+5. Telemetry and diagnostic events are captured for analysis.
+
+## Repository layout
+
+```text
+six-eyes/
+├── cmd/
+│   └── daemon/
+├── pkg/
+│   ├── bpf/
+│   ├── config/
+│   ├── coordinator/
+│   ├── desync/
+│   ├── ipc/
+│   ├── proxy/
+│   ├── scanner/
+│   ├── selftest/
+│   └── telemetry/
+├── scanner/
+├── configs/
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── go.mod
+├── six_eyes_architecture.md
+├── README.md
+└── ...
 ```
-Client (Six Eyes Daemon)             DPI Middlebox                Upstream Target
-      |                                    |                             |
-      |--- 1. TCP SYN -------------------->|---------------------------->|
-      |<-- 2. TCP SYN-ACK -----------------|<----------------------------|
-      |--- 3. TCP ACK (Established) ------>|---------------------------->|
-      |                                    |                             |
-      |=== 4. eBPF INJECT FAKE RST ======> | (DPI Session Table POISONED)|
-      |    (TTL=3, bad checksum)           | (Packet dies before Target) |
-      |                                                                  |
-      |--- 5. Real Payload (SNI) --------------------------------------->|
-      |    (Bypasses DPI Wire Sniffer)                                   |
-```
 
-### Supported Evasion Strategies:
-- **`FAKE_RST`**: Injects a forged TCP RST packet with a calibrated low TTL (e.g. 3 hops). The packet reaches and poisons the DPI middlebox's session table, causing it to discard inspection, while expiring before reaching the target web server.
-- **`HTTP_SPLIT` / `TLS_RECORD_SPLIT`**: Segments the initial 2 bytes of the payload across TCP packet boundaries, foiling regex pattern matching.
-- **`SEQ_OVERLAP`**: Transmits duplicate sequence numbers with decoy payloads to corrupt the middlebox's reassembly buffer.
-- **`OUT_OF_ORDER`**: Transmits trailing TCP segments before the initial segment.
+## Requirements
 
----
+This project is intended for Linux hosts with elevated networking capabilities. In practice, you will typically need:
 
-## 🚀 Quick Start: Pushing to Your Connected GitHub Account
+- Linux kernel with BPF support
+- Root or CAP_NET_ADMIN privileges
+- Go 1.22+
+- Clang / LLVM
+- Python 3
+- iproute2 and related packet tooling
+
+## Quick start
+
+### 1. Clone the repository
 
 ```bash
-# 1. Initialize git in the six-eyes directory
-git init
-
-# 2. Stage all modular files
-git add .
-
-# 3. Create initial structured migration commit
-git commit -m "feat(core): initialize six-eyes v10 autonomous eBPF DPI evasion daemon"
-
-# 4. Set main branch
-git branch -M main
-
-# 5. Add your remote
-git remote add origin https://github.com/<YOUR_USER>/six-eyes.git
-
-# 6. Push to GitHub
-git push -u origin main
+git clone https://github.com/<your-user>/six-eyes.git
+cd six-eyes
 ```
 
----
-
-## 🛠️ Build & Installation
+### 2. Install dependencies
 
 ```bash
-# Run preflight checks, compile eBPF bytecode, and build Go daemon
-make all
-
-# Run unit tests
-make test
-
-# Launch middlebox cartographer probe
-python3 scanner/cartographer.py --target cloudflare.com
+make deps
 ```
+
+### 3. Build the daemon
+
+```bash
+make build
+```
+
+This generates the required bytecode and produces the binary under `bin/`.
+
+### 4. Run the daemon
+
+```bash
+sudo ./bin/six-eyes
+```
+
+The project also includes a container-based setup for development or repeatable testing:
+
+```bash
+docker compose up --build
+```
+
+## Available workflows
+
+The project includes a few operational entrypoints:
+
+- `make all` - run preflight checks and build the project
+- `make test` - run Go test coverage for the package set
+- `make clean` - remove generated artifacts
+- `make git-setup` - initialize a Git repository scaffold on the `main` branch
+
+## Safety and responsible use
+
+Six Eyes is a research and testing project. It should only be used where you have explicit authorization to test and analyze network behavior. Avoid running it against public or shared infrastructure without consent.
+
+This repository is intended for:
+
+- Security research
+- Defensive packet analysis
+- Lab-based network experimentation
+- Architecture and protocol understanding
+
+It is not intended for unauthorized network interference.
+
+## Further reading
+
+For deeper design notes, see:
+
+- `six_eyes_architecture.md` - architecture and conceptual overview
+- `configs/` - configuration profiles
+- `scanner/` - middlebox discovery and traffic-oriented helper tooling
+
+## License
+
+This project is distributed under the repository's chosen license terms. Please review the license file in the repository before redistribution or commercial use.
