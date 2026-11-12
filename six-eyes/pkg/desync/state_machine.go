@@ -1,77 +1,66 @@
 package desync
 
-import (
-	"encoding/json"
-	"sync"
-	"sync/atomic"
-	"time"
+import "sync/atomic"
 
-	"github.com/six-eyes/six-eyes/pkg/config"
+type Phase uint32
+
+const (
+	PhasePassiveTTL Phase = iota
+	PhaseTLSFrag3
+	PhaseTLSMicroFrag5
+	PhaseTLSDisorder7
 )
 
+type PacingProfile struct {
+	Mode     string
+	Slices   int
+	DelayMs  int
+	JitterMs int
+	DecoyTTL uint8
+}
+
 type StateMachine struct {
-	cfg        *config.Profile
-	startTime  time.Time
-	mu         sync.RWMutex
-	isAttached bool
-	stats      struct {
-		PacketsProcessed uint64 `json:"packets_processed"`
-		FakeRstInjected  uint64 `json:"fake_rst_injected"`
-		SplitsExecuted   uint64 `json:"splits_executed"`
-		MiddleboxBypasses uint64 `json:"middlebox_bypasses"`
+	currentPhase atomic.Uint32
+	dpiHops      atomic.Int32
+}
+
+func NewStateMachine(dpiDistanceHops int) *StateMachine {
+	sm := &StateMachine{}
+	sm.currentPhase.Store(uint32(PhaseTLSFrag3))
+	sm.dpiHops.Store(int32(dpiDistanceHops))
+	return sm
+}
+
+func (s *StateMachine) CurrentPhase() Phase {
+	return Phase(s.currentPhase.Load())
+}
+
+func (s *StateMachine) SetDPIDistance(hops int) {
+	s.dpiHops.Store(int32(hops))
+}
+
+// SafeDecoyTTL computes a TTL that expires 1 hop before the Cloudflare edge
+// but 1 hop past the ISP DPI middlebox when topological data is available.
+func (s *StateMachine) SafeDecoyTTL() uint8 {
+	hops := s.dpiHops.Load()
+	if hops <= 1 || hops > 30 {
+		return 3
 	}
+	return uint8(hops + 1)
 }
 
-func NewStateMachine(cfg *config.Profile) *StateMachine {
-	return &StateMachine{
-		cfg:       cfg,
-		startTime: time.Now(),
+func (s *StateMachine) Escalate(currentMode string) (PacingProfile, bool) {
+	switch currentMode {
+	case "sni_front":
+		s.currentPhase.Store(uint32(PhaseTLSFrag3))
+		return PacingProfile{Mode: "tls_frag", Slices: 3, DelayMs: 2, JitterMs: 2, DecoyTTL: s.SafeDecoyTTL()}, true
+	case "tls_frag", "":
+		s.currentPhase.Store(uint32(PhaseTLSMicroFrag5))
+		return PacingProfile{Mode: "tls_micro_frag", Slices: 5, DelayMs: 3, JitterMs: 4, DecoyTTL: s.SafeDecoyTTL()}, true
+	case "tls_micro_frag":
+		s.currentPhase.Store(uint32(PhaseTLSDisorder7))
+		return PacingProfile{Mode: "tls_disorder", Slices: 7, DelayMs: 4, JitterMs: 6, DecoyTTL: s.SafeDecoyTTL()}, true
+	default:
+		return PacingProfile{}, false
 	}
-}
-
-func (sm *StateMachine) AttachInterface(iface string) error {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.isAttached = true
-	return nil
-}
-
-func (sm *StateMachine) DetachInterface(iface string) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.isAttached = false
-}
-
-func (sm *StateMachine) StartTime() time.Time {
-	return sm.startTime
-}
-
-func (sm *StateMachine) RecordPacket(isDesync bool) {
-	atomic.AddUint64(&sm.stats.PacketsProcessed, 1)
-	if isDesync {
-		if sm.cfg.Strategy == "FAKE_RST" {
-			atomic.AddUint64(&sm.stats.FakeRstInjected, 1)
-		} else {
-			atomic.AddUint64(&sm.stats.SplitsExecuted, 1)
-		}
-		atomic.AddUint64(&sm.stats.MiddleboxBypasses, 1)
-	}
-}
-
-func (sm *StateMachine) GetStatsJSON() string {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	data, _ := json.MarshalIndent(map[string]interface{}{
-		"app":                "six-eyes",
-		"version":            "v10.0-rc1",
-		"strategy":           sm.cfg.Strategy,
-		"ebpf_attached":      sm.isAttached,
-		"packets_processed":  atomic.LoadUint64(&sm.stats.PacketsProcessed),
-		"fake_rst_injected":  atomic.LoadUint64(&sm.stats.FakeRstInjected),
-		"splits_executed":    atomic.LoadUint64(&sm.stats.SplitsExecuted),
-		"middlebox_bypasses": atomic.LoadUint64(&sm.stats.MiddleboxBypasses),
-		"split_offset_bytes": sm.cfg.SplitOffset,
-		"fake_rst_ttl":       sm.cfg.FakeRstTTL,
-	}, "", "  ")
-	return string(data)
 }
